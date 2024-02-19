@@ -161,6 +161,7 @@ public class Application implements Serializable {
   @TableField(updateStrategy = FieldStrategy.IGNORED)
   private Date endTime;
 
+  @TableField(updateStrategy = FieldStrategy.IGNORED)
   private Long duration;
 
   /** checkpoint max failure interval */
@@ -326,8 +327,7 @@ public class Application implements Serializable {
    * @return true: can start | false: can not start.
    */
   public boolean isCanBeStart() {
-    FlinkAppState state = FlinkAppState.of(getState());
-    switch (state) {
+    switch (getFlinkAppStateEnum()) {
       case ADDED:
       case CREATED:
       case FAILED:
@@ -345,7 +345,7 @@ public class Application implements Serializable {
   }
 
   public boolean shouldBeTrack() {
-    return shouldTracking(FlinkAppState.of(getState())) == 1;
+    return shouldTracking(getFlinkAppStateEnum()) == 1;
   }
 
   @JsonIgnore

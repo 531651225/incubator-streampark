@@ -41,6 +41,7 @@ import org.apache.streampark.console.base.mybatis.pager.MybatisPager;
 import org.apache.streampark.console.base.util.CommonUtils;
 import org.apache.streampark.console.base.util.ObjectUtils;
 import org.apache.streampark.console.base.util.WebUtils;
+import org.apache.streampark.console.core.bean.AppControl;
 import org.apache.streampark.console.core.bean.MavenDependency;
 import org.apache.streampark.console.core.entity.AppBuildPipeline;
 import org.apache.streampark.console.core.entity.Application;
@@ -91,6 +92,7 @@ import org.apache.streampark.flink.kubernetes.helper.KubernetesDeploymentHelper;
 import org.apache.streampark.flink.kubernetes.model.FlinkMetricCV;
 import org.apache.streampark.flink.kubernetes.model.TrackId;
 import org.apache.streampark.flink.packer.pipeline.BuildResult;
+import org.apache.streampark.flink.packer.pipeline.PipelineStatus;
 import org.apache.streampark.flink.packer.pipeline.ShadedBuildResponse;
 
 import org.apache.commons.io.FileUtils;
@@ -216,8 +218,8 @@ public class ApplicationServiceImpl extends ServiceImpl<ApplicationMapper, Appli
 
   private final ExecutorService bootstrapExecutor =
       new ThreadPoolExecutor(
-          1,
           CPU_NUM,
+          CPU_NUM * 5,
           60L,
           TimeUnit.SECONDS,
           new LinkedBlockingQueue<>(),
@@ -503,7 +505,7 @@ public class ApplicationServiceImpl extends ServiceImpl<ApplicationMapper, Appli
       return null;
     }
     Page<Application> page = MybatisPager.getPage(request);
-    if (CommonUtils.notEmpty(appParam.getStateArray())) {
+    if (CommonUtils.notEmpty((Object) appParam.getStateArray())) {
       if (Arrays.stream(appParam.getStateArray())
           .anyMatch(x -> x == FlinkAppState.FINISHED.getValue())) {
         Integer[] newArray =
@@ -517,26 +519,60 @@ public class ApplicationServiceImpl extends ServiceImpl<ApplicationMapper, Appli
     this.baseMapper.page(page, appParam);
     List<Application> records = page.getRecords();
     long now = System.currentTimeMillis();
-    List<Application> newRecords =
+
+    List<Long> appIds = records.stream().map(Application::getId).collect(Collectors.toList());
+    Map<Long, PipelineStatus> pipeStates = appBuildPipeService.listPipelineStatus(appIds);
+
+    // add building pipeline status info and app control info
+    records =
         records.stream()
             .peek(
                 record -> {
-                  // status of flink job on kubernetes mode had been automatically persisted to db
-                  // in time.
+                  // 1) running Duration
+                  if (record.getTracking() == 1) {
+                    FlinkAppState state = record.getFlinkAppStateEnum();
+                    if (state == FlinkAppState.RUNNING
+                        || state == FlinkAppState.CANCELLING
+                        || state == FlinkAppState.MAPPING) {
+                      record.setDuration(now - record.getStartTime().getTime());
+                    }
+                  }
+                  // 2) k8s restURL
                   if (record.isKubernetesModeJob()) {
                     // set duration
                     String restUrl =
                         flinkK8sWatcher.getRemoteRestUrl(k8sWatcherWrapper.toTrackId(record));
                     record.setFlinkRestUrl(restUrl);
-                    if (record.getTracking() == 1
-                        && record.getStartTime() != null
-                        && record.getStartTime().getTime() > 0) {
-                      record.setDuration(now - record.getStartTime().getTime());
-                    }
                   }
                 })
+            .peek(
+                record -> {
+                  // 3) buildStatus
+                  if (pipeStates.containsKey(record.getId())) {
+                    record.setBuildStatus(pipeStates.get(record.getId()).getCode());
+                  }
+                })
+            .peek(
+                record -> {
+                  // 4) appControl
+                  AppControl appControl =
+                      new AppControl()
+                          .setAllowBuild(
+                              record.getBuildStatus() == null
+                                  || !PipelineStatus.running
+                                      .getCode()
+                                      .equals(record.getBuildStatus()))
+                          .setAllowStart(
+                              !record.shouldBeTrack()
+                                  && PipelineStatus.success
+                                      .getCode()
+                                      .equals(record.getBuildStatus()))
+                          .setAllowStop(record.isRunning());
+                  record.setAppControl(appControl);
+                })
             .collect(Collectors.toList());
-    page.setRecords(newRecords);
+
+    page.setRecords(records);
     return page;
   }
 
@@ -1417,6 +1453,10 @@ public class ApplicationServiceImpl extends ServiceImpl<ApplicationMapper, Appli
 
   @Override
   public void persistMetrics(Application appParam) {
+    if (appParam.getFlinkAppStateEnum() == FlinkAppState.RUNNING) {
+      appParam.setEndTime(null);
+      appParam.setDuration(null);
+    }
     this.baseMapper.persistMetrics(appParam);
   }
 
